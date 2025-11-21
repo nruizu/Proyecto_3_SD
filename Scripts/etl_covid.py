@@ -1,247 +1,167 @@
+import os
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import *
-import sys
-
-# Crear sesión Spark
-spark = SparkSession.builder \
-    .appName("COVID_ETL") \
-    .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem") \
-    .getOrCreate()
-
-# CONFIGURACIÓN
-BUCKET = "st0263-2024-2"
-
-print("="*80)
-print("INICIANDO PROCESO ETL - COVID COLOMBIA")
-print("="*80)
-
-# ===========================================
-# PASO 1: LEER DATOS DE COVID API
-# ===========================================
-
-print("\n[1/4] Leyendo datos de COVID de la API del Ministerio...")
-try:
-    df_covid = spark.read \
-        .option("header", "true") \
-        .option("inferSchema", "true") \
-        .option("encoding", "UTF-8") \
-        .csv(f"s3://{BUCKET}/raw/api/covid_api.csv")
-    
-    print(f"   ✓ Registros leídos: {df_covid.count()}")
-    print(f"   ✓ Columnas: {len(df_covid.columns)}")
-    
-    # Mostrar muestra
-    print("\n   Muestra de datos COVID:")
-    df_covid.show(3, truncate=True)
-    
-except Exception as e:
-    print(f"   ✗ ERROR al leer COVID: {e}")
-    sys.exit(1)
-
-# ===========================================
-# PASO 2: LEER DATOS DE RDS (CAPACIDAD HOSPITALARIA)
-# ===========================================
-
-print("\n[2/4] Leyendo datos de capacidad hospitalaria (RDS)...")
-try:
-    df_rds = spark.read \
-        .option("header", "true") \
-        .option("inferSchema", "true") \
-        .option("encoding", "UTF-8") \
-        .csv(f"s3://{BUCKET}/raw/rds/capacidad_atencion_por_municipio.csv")
-    
-    print(f"   ✓ Registros leídos: {df_rds.count()}")
-    print(f"   ✓ Columnas: {df_rds.columns}")
-    
-    # Mostrar muestra
-    print("\n   Muestra de datos RDS:")
-    df_rds.show(3, truncate=False)
-    
-except Exception as e:
-    print(f"   ✗ ERROR al leer RDS: {e}")
-    sys.exit(1)
-
-# ===========================================
-# PASO 3: LIMPIEZA Y PREPARACIÓN DE DATOS
-# ===========================================
-
-print("\n[3/4] Limpiando y preparando datos...")
-
-# ============ LIMPIEZA COVID ============
-print("   → Procesando datos COVID...")
-
-df_covid_clean = df_covid \
-    .dropna(subset=["fecha_reporte_web", "departamento_nom"]) \
-    .withColumn("fecha", to_date(col("fecha_reporte_web"), "yyyy-MM-dd")) \
-    .withColumn("fecha_notificacion", to_date(col("fecha_de_notificaci_n"), "yyyy-MM-dd")) \
-    .withColumn("fecha_sintomas", to_date(col("fecha_inicio_sintomas"), "yyyy-MM-dd")) \
-    .withColumn("fecha_diagnostico", to_date(col("fecha_diagnostico"), "yyyy-MM-dd")) \
-    .withColumn("fecha_muerte", to_date(col("fecha_muerte"), "yyyy-MM-dd")) \
-    .withColumn("fecha_recuperado", to_date(col("fecha_recuperado"), "yyyy-MM-dd"))
-
-# Convertir edad a entero y filtrar valores válidos
-df_covid_clean = df_covid_clean \
-    .withColumn("edad", col("edad").cast("integer")) \
-    .filter(col("edad").isNotNull()) \
-    .filter((col("edad") >= 0) & (col("edad") <= 120))
-
-# Normalizar nombres de municipios (quitar espacios extra, mayúsculas)
-df_covid_clean = df_covid_clean \
-    .withColumn("municipio_normalizado", 
-                upper(trim(col("ciudad_municipio_nom"))))
-
-# Normalizar departamentos
-df_covid_clean = df_covid_clean \
-    .withColumn("departamento_normalizado", 
-                upper(trim(col("departamento_nom"))))
-
-# Limpiar estado (recuperado/fallecido)
-df_covid_clean = df_covid_clean \
-    .withColumn("estado_clean", upper(trim(col("estado")))) \
-    .withColumn("recuperado_clean", upper(trim(col("recuperado")))) \
-    .withColumn("sexo_clean", upper(trim(col("sexo"))))
-
-print(f"   ✓ Datos COVID limpios: {df_covid_clean.count()} registros")
-
-# ============ LIMPIEZA RDS ============
-print("   → Procesando datos de capacidad hospitalaria...")
-
-df_rds_clean = df_rds \
-    .dropna() \
-    .withColumn("municipio_normalizado", upper(trim(col("municipio")))) \
-    .withColumn("camas_disponibles", col("camas").cast("integer")) \
-    .withColumn("camas_uci_disponibles", col("camas_uci").cast("integer"))
-
-print(f"   ✓ Datos RDS limpios: {df_rds_clean.count()} registros")
-
-# ===========================================
-# PASO 4: UNIÓN DE DATOS (JOIN POR MUNICIPIO)
-# ===========================================
-
-print("\n[4/4] Uniendo datos COVID con capacidad hospitalaria por municipio...")
-
-# Realizar JOIN por municipio
-df_joined = df_covid_clean.join(
-    df_rds_clean.select(
-        col("municipio_normalizado"),
-        col("camas_disponibles"),
-        col("camas_uci_disponibles"),
-        col("id_municipio").alias("id_municipio_rds")
-    ),
-    on="municipio_normalizado",
-    how="left"
+from pyspark.sql.functions import (
+    col,
+    to_date,
+    year,
+    month,
+    dayofmonth,
 )
 
-print(f"   ✓ Registros después del JOIN: {df_joined.count()}")
+# ============================================================
+# RUTAS S3 REALES DE TU PROYECTO
+# ============================================================
 
-# Calcular estadística: cuántos registros tienen info hospitalaria
-registros_con_hospitales = df_joined.filter(col("camas_disponibles").isNotNull()).count()
-porcentaje = round((registros_con_hospitales / df_joined.count()) * 100, 2)
-print(f"   ✓ Registros con datos hospitalarios: {registros_con_hospitales} ({porcentaje}%)")
+BUCKET = ("nruizudatalake")
 
-# Seleccionar y renombrar columnas finales
-df_final = df_joined.select(
-    # Información temporal
-    col("fecha").alias("fecha_reporte"),
-    col("fecha_notificacion"),
-    col("fecha_sintomas"),
-    col("fecha_diagnostico"),
-    col("fecha_muerte"),
-    col("fecha_recuperado"),
-    
-    # Identificadores
-    col("id_de_caso").alias("id_caso"),
-    col("departamento").alias("cod_departamento"),
-    col("departamento_nom").alias("departamento"),
-    col("ciudad_municipio").alias("cod_municipio"),
-    col("ciudad_municipio_nom").alias("municipio"),
-    
-    # Datos del paciente
-    col("edad"),
-    col("unidad_medida").alias("unidad_edad"),
-    col("sexo_clean").alias("sexo"),
-    col("per_etn_").alias("pertenencia_etnica"),
-    col("nom_grupo_").alias("nombre_grupo_etnico"),
-    
-    # Estado y evolución
-    col("estado_clean").alias("estado"),
-    col("recuperado_clean").alias("recuperado"),
-    col("tipo_recuperacion"),
-    col("ubicacion"),
-    
-    # Contexto
-    col("fuente_tipo_contagio"),
-    col("pais_viajo_1_cod").alias("pais_viaje_cod"),
-    col("pais_viajo_1_nom").alias("pais_viaje"),
-    
-    # Datos hospitalarios (del JOIN)
-    col("camas_disponibles"),
-    col("camas_uci_disponibles"),
-    col("id_municipio_rds")
-)
+# Rutas reales
+COVID_INPUT_PATH = f"s3://{BUCKET}/raw/api/covid_api.csv"
+RDS_INPUT_PATH = f"s3://{BUCKET}/raw/rds/poblacion.csv"
+TRUSTED_OUTPUT_PATH = f"s3://{BUCKET}/trusted/covid/"
 
-# ===========================================
-# PASO 5: GUARDAR EN ZONA TRUSTED
-# ===========================================
 
-print("\n[GUARDANDO] Escribiendo datos en zona TRUSTED...")
+# ============================================================
+# CREAR SPARK SESSION (compatible con local y EMR)
+# ============================================================
 
-output_path = f"s3://{BUCKET}/trusted/covid_procesado/"
+def create_spark_session(app_name: str):
+    spark = (
+        SparkSession.builder
+        .appName(app_name)
+        .getOrCreate()
+    )
+    spark.sparkContext.setLogLevel("WARN")
+    return spark
 
-try:
-    # Particionar por fecha para optimizar consultas
-    df_final.write \
-        .mode("overwrite") \
-        .partitionBy("fecha_reporte") \
-        .parquet(output_path)
-    
-    print(f"   ✓✓✓ Datos guardados exitosamente en: {output_path}")
-    
-except Exception as e:
-    print(f"   ✗ ERROR al guardar: {e}")
-    sys.exit(1)
 
-# ===========================================
-# ESTADÍSTICAS FINALES
-# ===========================================
+# ============================================================
+# MAIN ETL
+# ============================================================
 
-print("\n" + "="*80)
-print("ESTADÍSTICAS DEL ETL:")
-print("="*80)
+def main():
 
-stats = df_final.agg(
-    count("*").alias("total_registros"),
-    countDistinct("departamento").alias("departamentos_unicos"),
-    countDistinct("municipio").alias("municipios_unicos"),
-    min("fecha_reporte").alias("fecha_inicio"),
-    max("fecha_reporte").alias("fecha_fin"),
-    sum(when(col("estado") == "FALLECIDO", 1).otherwise(0)).alias("total_fallecidos"),
-    sum(when(col("recuperado") == "RECUPERADO", 1).otherwise(0)).alias("total_recuperados"),
-    round(avg("edad"), 1).alias("edad_promedio"),
-    sum(when(col("sexo") == "F", 1).otherwise(0)).alias("casos_femenino"),
-    sum(when(col("sexo") == "M", 1).otherwise(0)).alias("casos_masculino"),
-    countDistinct(when(col("camas_disponibles").isNotNull(), col("municipio"))).alias("municipios_con_datos_hospitalarios")
-).collect()[0]
+    spark = create_spark_session("covid_raw_to_trusted")
 
-print(f"\nTotal de registros procesados:     {stats['total_registros']:,}")
-print(f"Departamentos únicos:               {stats['departamentos_unicos']}")
-print(f"Municipios únicos:                  {stats['municipios_unicos']}")
-print(f"Municipios con datos hospitalarios: {stats['municipios_con_datos_hospitalarios']}")
-print(f"Período:                            {stats['fecha_inicio']} a {stats['fecha_fin']}")
-print(f"Total fallecidos:                   {stats['total_fallecidos']:,}")
-print(f"Total recuperados:                  {stats['total_recuperados']:,}")
-print(f"Edad promedio:                      {stats['edad_promedio']} años")
-print(f"Casos femenino:                     {stats['casos_femenino']:,}")
-print(f"Casos masculino:                    {stats['casos_masculino']:,}")
+    # ---------------------------
+    # Leer datos COVID API (raw)
+    # ---------------------------
+    print(f"[INFO] Leyendo casos COVID desde: {COVID_INPUT_PATH}")
+    df_covid = (
+        spark.read
+        .option("header", True)
+        .option("inferSchema", True)
+        .csv(COVID_INPUT_PATH)
+    )
 
-# Mostrar muestra final
-print("\n" + "="*80)
-print("MUESTRA DE DATOS PROCESADOS (5 registros):")
-print("="*80)
-df_final.show(5, truncate=False)
+    print(f"[INFO] Filas COVID cargadas: {df_covid.count()}")
 
-print("\n" + "="*80)
-print("✓✓✓ ETL COMPLETADO EXITOSAMENTE ✓✓✓")
-print("="*80)
+    # ---------------------------
+    # Leer datos RDS (demografía)
+    # ---------------------------
+    print(f"[INFO] Leyendo población desde: {RDS_INPUT_PATH}")
+    df_demog = (
+        spark.read
+        .option("header", True)
+        .option("inferSchema", True)
+        .csv(RDS_INPUT_PATH)
+    )
 
-spark.stop()
+    print(f"[INFO] Filas demográficas cargadas: {df_demog.count()}")
+
+    # ---------------------------
+    # JOIN usando DIVIPOLA
+    # covid.departamento  <->  demog.codigo_departamento
+    # ---------------------------
+    print("[INFO] Realizando JOIN DIVIPOLA (departamento)")
+
+    df_join = (
+        df_covid.alias("covid")
+        .join(
+            df_demog.alias("demog"),
+            col("covid.departamento").cast("string") ==
+            col("demog.codigo_departamento").cast("string"),
+            "left"
+        )
+    )
+
+    print("[INFO] JOIN completado")
+
+    # ---------------------------
+    # Parse de fechas + particiones
+    # ---------------------------
+    print("[INFO] Procesando columnas de fecha...")
+
+    df_join = (
+        df_join.withColumn("fecha_reporte_web_date",
+                           to_date(col("covid.fecha_reporte_web")))
+        .withColumn("anio", year(col("fecha_reporte_web_date")))
+        .withColumn("mes", month(col("fecha_reporte_web_date")))
+        .withColumn("dia", dayofmonth(col("fecha_reporte_web_date")))
+    )
+
+    # ---------------------------
+    # Selección columnas finales
+    # ---------------------------
+    print("[INFO] Seleccionando columnas finales...")
+
+    df_trusted = df_join.select(
+        # COVID
+        col("covid.id_de_caso"),
+        col("covid.fecha_reporte_web"),
+        col("fecha_reporte_web_date"),
+        col("covid.fecha_de_notificaci_n"),
+        col("anio"),
+        col("mes"),
+        col("dia"),
+        col("covid.departamento").alias("codigo_divipola_departamento"),
+        col("covid.departamento_nom"),
+        col("covid.ciudad_municipio").alias("codigo_divipola_municipio"),
+        col("covid.ciudad_municipio_nom").alias("nombre_municipio"),
+        col("covid.edad"),
+        col("covid.unidad_medida"),
+        col("covid.sexo"),
+        col("covid.fuente_tipo_contagio"),
+        col("covid.ubicacion"),
+        col("covid.estado"),
+        col("covid.pais_viajo_1_cod"),
+        col("covid.pais_viajo_1_nom"),
+        col("covid.recuperado"),
+        col("covid.fecha_inicio_sintomas"),
+        col("covid.fecha_muerte"),
+        col("covid.fecha_diagnostico"),
+        col("covid.fecha_recuperado"),
+        col("covid.tipo_recuperacion"),
+        col("covid.per_etn_"),
+        col("covid.nom_grupo_"),
+
+        # Demografía enriquecida
+        col("demog.codigo_departamento"),
+        col("demog.departamento").alias("departamento_nombre_normalizado"),
+        col("demog.poblacion"),
+    )
+
+    print(f"[INFO] Columnas finales: {len(df_trusted.columns)}")
+
+    # ---------------------------
+    # Escritura en TRUSTED
+    # ---------------------------
+    print(f"[INFO] Escribiendo TRUSTED en: {TRUSTED_OUTPUT_PATH}")
+
+    (
+        df_trusted
+        .write
+        .mode("overwrite")
+        .partitionBy("anio", "mes", "dia")
+        .parquet(TRUSTED_OUTPUT_PATH)
+    )
+
+    print("[OK] ETL COMPLETADO exitosamente.")
+    spark.stop()
+
+
+# ============================================================
+# EJECUCIÓN
+# ============================================================
+
+if __name__ == "__main__":
+    main()
